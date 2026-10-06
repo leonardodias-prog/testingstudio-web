@@ -1,0 +1,7 @@
+# segredo: a chave da Gemini API
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/

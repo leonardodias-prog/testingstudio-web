@@ -1,0 +1,5 @@
+[server]
+showEmailPrompt = false     # não pergunta e-mail na primeira execução
+
+[browser]
+gatherUsageStats = false    # não envia estatísticas de uso
