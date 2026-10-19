@@ -24,7 +24,7 @@ import math
 import operator
 import re
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 
 NULO = None  # o NULL do banco / 4GL
@@ -89,6 +89,12 @@ class Unidade:
     entradas: list
     formula: str = ""              # ex.: (p_val1 * p_val2) + p_val3
     saida: Entrada | None = None   # variável devolvida no RETURN
+    erro_codigo: str = ""          # o que a função devolve quando a regra é violada (ex.: -1)
+    limites_regra: dict = field(default_factory=dict)   # {"val_param1": {"min": "0"}} vindos do código
+
+    def erro(self):
+        """Regra de negócio no formato que analisar() recebe (ou None)."""
+        return {"codigo": self.erro_codigo, "limites": self.limites_regra} if self.erro_codigo else None
 
 
 def _vazio(v) -> bool:
@@ -129,8 +135,8 @@ def entrada_de_dict(d: dict) -> Entrada:
 # ═══════════════════════════════════════════════════════════════════════════
 _TIPOS_4GL = (r"DECIMAL|DEC|NUMERIC|MONEY|INTEGER|INT8|INT|SMALLINT|BIGINT|SERIAL8|SERIAL"
               r"|CHARACTER|CHAR|NVARCHAR|VARCHAR|NCHAR|SMALLFLOAT|FLOAT|REAL")
-_RE_DECLARACAO = re.compile(
-    rf"\b(\w+)\s+({_TIPOS_4GL})\b(?:\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?", re.I)
+_RE_DECLARACAO = re.compile(   # aceita "a DECIMAL(12,2)" e "a, b, c DECIMAL(12,2)"
+    rf"\b(\w+(?:\s*,\s*\w+)*)\s+({_TIPOS_4GL})\b(?:\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?", re.I)
 _RE_FUNCAO = re.compile(
     r"^[ \t]*FUNCTION\s+(\w+)\s*\(([^)]*)\)(.*?)^[ \t]*END\s+FUNCTION", re.I | re.M | re.S)
 
@@ -143,12 +149,21 @@ def _sem_comentarios(codigo: str) -> str:
 def _declaracoes(trecho: str) -> dict:
     """Acha 'nome TIPO(p,s)' e devolve {nome em minúsculas: Entrada}."""
     achadas = {}
-    for nome, tipo, n1, n2 in _RE_DECLARACAO.findall(trecho):
+    for nomes, tipo, n1, n2 in _RE_DECLARACAO.findall(trecho):
         original = tipo.upper()
         casas = int(n2) if n2 else (2 if original == "MONEY" else None)
-        achadas[nome.lower()] = Entrada(nome=nome, tipo=SINONIMOS.get(original, original),
-                                        tamanho=int(n1) if n1 else None, casas=casas)
+        for nome in re.split(r"\s*,\s*", nomes):
+            achadas[nome.lower()] = Entrada(nome=nome, tipo=SINONIMOS.get(original, original),
+                                            tamanho=int(n1) if n1 else None, casas=casas)
     return achadas
+
+
+def codigo_da_unidade(codigo: str, nome: str) -> str:
+    """O trecho FUNCTION ... END FUNCTION de uma unidade (para o relatório)."""
+    for m in _RE_FUNCAO.finditer(codigo):
+        if m.group(1).lower() == nome.lower():
+            return m.group(0).strip("\n")
+    return codigo
 
 
 def extrair_unidades(codigo: str) -> list:
@@ -161,9 +176,22 @@ def extrair_unidades(codigo: str) -> list:
         locais = _declaracoes(corpo)
         entradas = []
 
-        # a) parâmetros: FUNCTION cad0001_calcula_valor(p_val1, p_val2, p_val3)
-        for p in (x.strip() for x in parametros.split(",") if x.strip()):
-            achada = locais.get(p.lower())
+        # a) parâmetros: FUNCTION cad0001_calcula_valor(val_param1, val_param2, val_param3).
+        #    Apelido: "LET p_val1 = val_param1" → p_val1 é o parâmetro com outro nome
+        #    (e o tipo do parâmetro vem do DEFINE de p_val1).
+        params = [x.strip() for x in parametros.split(",") if x.strip()]
+        por_minusculo = {p.lower(): p for p in params}
+        apelidos = {}
+        for local, origem in re.findall(r"\bLET\s+(\w+)\s*=\s*(\w+)\b(?!\s*[-+*/(.\[])", corpo, re.I):
+            if origem.lower() in por_minusculo and local.lower() not in por_minusculo:
+                apelidos[local.lower()] = por_minusculo[origem.lower()]
+
+        def parametro(nome_var: str) -> str:    # p_val1 → val_param1 (ou o próprio nome)
+            return apelidos.get(nome_var.lower(), nome_var)
+
+        for p in params:
+            achada = locais.get(p.lower()) or next(
+                (locais[local] for local, alvo in apelidos.items() if alvo == p and local in locais), None)
             entradas.append(replace(achada, nome=p) if achada else Entrada(nome=p))
 
         # b) campos de RECORD global que a função LÊ (ex.: mr_item.cod_item).
@@ -175,21 +203,53 @@ def extrair_unidades(codigo: str) -> list:
             if campo in usados and campo not in calculados and campo not in ja_tem:
                 entradas.append(replace(declarada))
 
-        # c) NULL tratado no código: IF x IS NULL THEN LET x = 0
-        tratados = re.findall(r"\bIF\s+([\w.]+)\s+IS\s+NULL\s+THEN\s+LET\s+\1\s*=\s*(\S+)", corpo, re.I)
-        for var, valor in tratados:
+        # c) NULL tratado no código: IF x IS NULL THEN LET x = 0  (ou LET apelido_de_x = 0)
+        tratados = re.findall(r"\bIF\s+([\w.]+)\s+IS\s+NULL\s+THEN\s+LET\s+([\w.]+)\s*=\s*(\S+)", corpo, re.I)
+        for var, destino, valor in tratados:
+            alvo = parametro(var.split(".")[-1])
+            if parametro(destino.split(".")[-1]).lower() != alvo.lower():
+                continue                         # o LET mexe em outra variável: não é tratamento de NULL
             for e in entradas:
-                if e.nome.lower() == var.split(".")[-1].lower():
+                if e.nome.lower() == alvo.lower():
                     e.aceita_nulo, e.se_nulo = True, valor
 
-        # d) saída: RETURN <variável>; o LET que a calcula vira a regra (oráculo)
+        # d) regra de negócio com código de erro: IF p_val1 < 0 OR p_val2 < 0 THEN RETURN -1
+        #    vira limite da faixa válida (mínimo 0) e o oráculo passa a esperar "Erro (-1)".
+        erro_codigo, limites_regra = "", {}
+        regra = r"\bIF\s+((?:(?!\bTHEN\b|\bIF\b).)+?)\s+THEN\s+RETURN\s+(-?[\w.]+)"
+        for condicao, codigo_retorno in re.findall(regra, corpo, re.I | re.S):
+            comparacoes = [re.fullmatch(r"([\w.]+)\s*(<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)", parte.strip())
+                           for parte in re.split(r"\s+OR\s+", condicao.strip(), flags=re.I)]
+            if not all(comparacoes):
+                continue                         # só regras do tipo "x < N OR y > M"
+            for comparacao in comparacoes:
+                var, op, n = comparacao.groups()
+                e = next((x for x in entradas if x.nome.lower() == parametro(var.split(".")[-1]).lower()), None)
+                if e is None or not e.tipo:
+                    continue
+                eps = calcular_epsilon(e)[0] or Decimal(0)
+                lim = limites_regra.setdefault(e.nome, {})
+                if op == "<":                    # x < N é erro → válido a partir de N
+                    e.minimo = lim["min"] = n
+                elif op == "<=":                 # x <= N é erro → válido a partir de N + ε
+                    e.minimo = lim["min"] = fmt(Decimal(n) + eps)
+                elif op == ">":                  # x > N é erro → válido até N
+                    e.maximo = lim["max"] = n
+                else:                            # x >= N é erro → válido até N − ε
+                    e.maximo = lim["max"] = fmt(Decimal(n) - eps)
+            erro_codigo = codigo_retorno
+            break
+
+        # e) saída: RETURN <variável declarada>; o LET que a calcula vira a regra (oráculo)
         saida, formula = None, ""
-        retorno = re.search(r"\bRETURN\s+(\w+)", corpo, re.I)
-        if retorno and retorno.group(1).lower() in locais:
-            saida = locais[retorno.group(1).lower()]
-            let = re.search(rf"\bLET\s+{retorno.group(1)}\s*=\s*(.+)", corpo, re.I)
-            formula = let.group(1).strip() if let else ""
-        unidades.append(Unidade(nome, entradas, formula, saida))
+        for retorno in re.findall(r"\bRETURN\s+(\w+)", corpo, re.I):
+            if retorno.lower() in locais:
+                saida = locais[retorno.lower()]
+                let = re.search(rf"\bLET\s+{retorno}\s*=\s*(.+)", corpo, re.I)
+                formula = let.group(1).strip() if let else ""
+                break
+        formula = re.sub(r"\b\w+\b", lambda m: parametro(m.group()), formula)   # p_val1 → val_param1
+        unidades.append(Unidade(nome, entradas, formula, saida, erro_codigo, limites_regra))
     return unidades
 
 
@@ -249,6 +309,8 @@ class Faixa:
     epsilon: object      # Decimal; None em FLOAT (lá o ε muda com X)
     regra: str           # como o ε foi calculado
     aviso: str = ""
+    erro_min: str = ""   # código que o programa devolve abaixo do mínimo (ex.: "-1"), se a regra estiver no código
+    erro_max: str = ""   # idem, acima do máximo
 
 
 def resolver(e: Entrada) -> Faixa:
@@ -372,12 +434,12 @@ def classes_equivalencia(faixas, tipicos, saida_faixa=None) -> list:
 
 
 def _longe(f: Faixa):
-    """Distância 'confortável' da fronteira: meia largura da faixa (no mínimo ε).
-    Ex.: idade de 18 a 65 → representantes inválidos -6 e 89."""
+    """Distância 'confortável' da fronteira: meia largura da faixa, no máximo 100 e no mínimo ε.
+    Ex.: idade de 18 a 65 → -6 e 89; valor ≥ 0,00 → -100,00 (o 'Exterior' do manual)."""
     meia = f.maximo / 2 - f.minimo / 2          # assim não estoura em FLOAT
     if f.epsilon is None:
-        return meia or 1.0
-    return max(meia.quantize(f.epsilon, rounding=ROUND_HALF_UP), f.epsilon)
+        return min(meia, 100.0) or 1.0
+    return max(min(meia, Decimal(100)).quantize(f.epsilon, rounding=ROUND_HALF_UP), f.epsilon)
 
 
 def _classe_de(classes, f, v) -> str:
@@ -434,9 +496,23 @@ def _contexto(valores: dict, faixas) -> dict:
 
 def resultado_esperado(valores, faixas, formula, saida_faixa):
     """Devolve (texto do resultado esperado, valor da saída ou None)."""
-    problemas = [f"{f.entrada.nome} {'NULL' if valores[f.entrada.nome] is NULO else 'fora da faixa'}"
-                 for f in faixas if not valido(f, valores[f.entrada.nome])]
+    problemas, codigos = [], set()
+    for f in faixas:
+        v = valores[f.entrada.nome]
+        if valido(f, v):
+            continue
+        if v is NULO:
+            problemas.append(f"{f.entrada.nome} NULL")
+            codigos.add("")
+        elif _medida(v) < f.minimo:
+            problemas.append(f"{f.entrada.nome} < {fmt(f.minimo)}")
+            codigos.add(f.erro_min)
+        else:
+            problemas.append(f"{f.entrada.nome} > {fmt(f.maximo)}")
+            codigos.add(f.erro_max)
     if problemas:
+        if len(codigos) == 1 and "" not in codigos:      # só violou a regra que o código trata
+            return f"❌ Erro ({codigos.pop()}) — " + ", ".join(problemas), None
         return "❌ Rejeitar (" + ", ".join(problemas) + ")", None
     if _vazio(formula):
         return "✅ Aceitar", None
@@ -600,8 +676,49 @@ def fmt_eps(f: Faixa, X=None) -> str:
     return f"{fmt(f.epsilon)} car." if f.entrada.tipo == "CHAR" else fmt(f.epsilon)
 
 
-def analisar(entradas: list, formula: str = "", saida: Entrada | None = None) -> dict:
-    """Aplica PCE + AVL nas entradas e devolve as tabelas prontas para a tela."""
+def _origem(f: Faixa, lado: str) -> str:
+    if (f.erro_min if lado == "min" else f.erro_max):
+        return f"regra do código (erro {f.erro_min or f.erro_max})"
+    informado = f.entrada.minimo if lado == "min" else f.entrada.maximo
+    return "informado na tabela" if not _vazio(informado) else (
+        "padrão: 1 caractere" if f.entrada.tipo == "CHAR" and lado == "min" else "limite do tipo")
+
+
+def pontos_fronteira(faixas, tipicos, formula, saida_faixa) -> list:
+    """Os 4 pontos do manual da Sprint 1 em cada fronteira X:
+    On (X, na fronteira) · Off (o 1º ponto fora: X ∓ ε) ·
+    Interior (bem dentro: X ± 100) · Exterior (bem fora: X ∓ 100)."""
+    linhas = []
+    for f in faixas:
+        if f.entrada.tipo == "CHAR":
+            continue                              # a régua do manual é numérica
+        for lado, X, sentido in (("min", f.minimo, 1), ("max", f.maximo, -1)):
+            menos, _, mais = vizinhos(f, X)
+            fora = menos if sentido == 1 else mais
+            d = Decimal(100) if f.epsilon is not None else 100.0
+            dentro = X + sentido * d
+            if not f.minimo <= dentro <= f.maximo:  # faixa estreita: usa o meio
+                dentro = tipicos[f.entrada.nome]
+            pontos = (("On", X, "exatamente na fronteira"), ("Off", fora, "1º ponto fora (X ∓ ε)"),
+                      ("Interior", dentro, "bem dentro da região válida"),
+                      ("Exterior", X - sentido * d, "bem dentro da região inválida"))
+            for ponto, v, condicao in pontos:
+                esperado, _ = resultado_esperado({**tipicos, f.entrada.nome: v}, faixas, formula, saida_faixa)
+                linhas.append({
+                    "Variável": f.entrada.nome,
+                    "Fronteira": f"{'mín' if lado == 'min' else 'máx'} = {fmt(X)} ({_origem(f, lado)})",
+                    "Ponto": ponto,
+                    "Valor": fmt(v),
+                    "Condição": condicao,
+                    "Válido?": "✅" if valido(f, v) else "❌",
+                    "Resultado esperado": esperado,
+                })
+    return linhas
+
+
+def analisar(entradas: list, formula: str = "", saida: Entrada | None = None, erro: dict | None = None) -> dict:
+    """Aplica PCE + AVL nas entradas e devolve as tabelas prontas para a tela.
+    erro: regra de negócio do código, ex.: {"codigo": "-1", "limites": {"val_param1": {"min": "0"}}}."""
     with localcontext() as ctx:
         ctx.prec = 60   # folga para DECIMAL(32): nenhuma conta é arredondada no meio
         entradas = [e for e in entradas if e.nome]
@@ -612,6 +729,12 @@ def analisar(entradas: list, formula: str = "", saida: Entrada | None = None) ->
             raise ValueError(f"variável repetida na tabela: {', '.join(sorted(repetidas))}")
 
         faixas = [resolver(e) for e in entradas]
+        for f in faixas:   # o limite ainda é o da regra do código? então o esperado é o código de erro
+            regra = (erro or {}).get("limites", {}).get(f.entrada.nome, {})
+            if "min" in regra and numero(regra["min"]) == f.minimo:
+                f.erro_min = erro["codigo"]
+            if "max" in regra and numero(regra["max"]) == f.maximo:
+                f.erro_max = erro["codigo"]
         tipicos, deslocamento = {}, 0
         for f in faixas:
             tipicos[f.entrada.nome] = tipico(f, deslocamento)
@@ -642,6 +765,7 @@ def analisar(entradas: list, formula: str = "", saida: Entrada | None = None) ->
                 "Como o ε foi calculado": f.regra,
                 "Faixa válida": f"{fmt(f.minimo)} a {fmt(f.maximo)}"
                                 + (" caracteres" if f.entrada.tipo == "CHAR" else ""),
+                "Origem dos limites": f"mín: {_origem(f, 'min')} · máx: {_origem(f, 'max')}",
             } for f in todas],
             "classes": [{
                 "ID": c.id,
@@ -649,9 +773,10 @@ def analisar(entradas: list, formula: str = "", saida: Entrada | None = None) ->
                 "Classe": "válida" if c.valida else "inválida",
                 "Condição": c.condicao,
                 "Representante": "—" if c.faixa is saida_faixa else fmt(c.representante),
-                "Coberta por": ", ".join(cobertura[c.id]) or "⚠️ nenhum caso",
+                "Coberta por": ", ".join(cobertura[c.id]) or "⚠️ nenhum caso (pode ser inviável)",
             } for c in classes],
             "limites": valores_limite(faixas, saida_faixa),
+            "pontos": pontos_fronteira(faixas, tipicos, formula, saida_faixa),
             "casos": casos,
             "avisos": avisos,
         }

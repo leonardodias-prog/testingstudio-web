@@ -1,0 +1,14 @@
+-- Programa CAD0001: Calculo do Item (cad0001_item_calculo.txt)
+FUNCTION cad0001_calcula_valor(val_param1, val_param2, val_param3)
+    DEFINE p_val1, p_val2, p_val3 DECIMAL(12,2)
+    DEFINE l_val_calculado DECIMAL(12,2)
+    IF val_param1 IS NULL THEN LET p_val1 = 0 ELSE LET p_val1 = val_param1 END IF
+    IF val_param2 IS NULL THEN LET p_val2 = 0 ELSE LET p_val2 = val_param2 END IF
+    IF val_param3 IS NULL THEN LET p_val3 = 0 ELSE LET p_val3 = val_param3 END IF
+    -- Regra de Negocio de Fronteira: Valores nao podem ser negativos (< 0.00)
+    IF p_val1 < 0 OR p_val2 < 0 OR p_val3 < 0 THEN
+        RETURN -1 -- Codigo de Erro de Parametro Invalido
+    END IF
+    LET l_val_calculado = (p_val1 * p_val2) + p_val3
+    RETURN l_val_calculado
+END FUNCTION

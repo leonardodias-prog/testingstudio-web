@@ -1,7 +1,7 @@
 @echo off
 REM TestingStudio Web - dois cliques para abrir no navegador
 cd /d "%~dp0"
-python -c "import streamlit, google.genai" 2>nul || (
+python -c "import streamlit, google.genai, matplotlib, fpdf" 2>nul || (
     echo Instalando as dependencias pela primeira vez...
     python -m pip install -r requirements.txt
 )

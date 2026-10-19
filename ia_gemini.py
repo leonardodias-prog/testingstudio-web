@@ -2,8 +2,9 @@
 ia_gemini.py — Conexão com a Gemini API (motor de análise baseado em IA)
 =========================================================================
 A IA é parceira de pareamento (Protocolo 4): ela EXPLICA o código, INTERPRETA
-textos e REVISA os casos de teste. Quem calcula PCE, AVL e ε é o Python
-(caixa_preta.py) — a lógica não é terceirizada para a IA.
+textos e REVISA os casos de teste. Quem calcula PCE, AVL e ε (caixa_preta.py),
+o grafo e o V(G) (caixa_branca.py) e a RTM (rtm.py) é o Python — a lógica não é
+terceirizada para a IA.
 
 Chave gratuita: https://aistudio.google.com/apikey
 """
@@ -18,8 +19,9 @@ from caixa_preta import TIPOS
 
 # estáveis e menos disputados primeiro (os mais novos vivem sobrecarregados, erro 503);
 # se nenhum existir, vale o 1º "flash" da lista. Dá para trocar na barra lateral.
-PREFERIDOS = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash", "gemini-3.6-flash",
+PREFERIDOS = ["gemini-2.5-flash", "gemini-3.5-flash", "gemini-flash-latest", "gemini-3.6-flash",
               "gemini-3.7-flash", "gemini-3.8-flash"]
+_ultimo_que_funcionou = None   # na próxima chamada, começa por ele
 NAO_TEXTO = ("tts", "image", "live", "audio", "embedding", "transcribe", "computer",
              "robotics", "veo", "lyria", "imagen", "research", "antigravity")
 OCUPADO = (404, 429, 500, 503, 504)   # modelo indisponível, ocupado ou no limite: tenta o próximo
@@ -59,8 +61,13 @@ def chave_recusada(erro: Exception) -> bool:
 
 
 def _gerar(cliente, modelos, prompt: str, json_saida: bool = False) -> str:
-    """Pede ao 1º modelo da lista; se ele estiver ocupado ou demorar, tenta os próximos (até 4)."""
-    tentativas = ([modelos] if isinstance(modelos, str) else list(modelos))[:4]
+    """Pede ao 1º modelo da lista; se ele estiver ocupado ou demorar, tenta os próximos (até 6).
+    O último modelo que respondeu bem vai para o começo da fila."""
+    global _ultimo_que_funcionou
+    lista = [modelos] if isinstance(modelos, str) else list(modelos)
+    if _ultimo_que_funcionou in lista[1:]:
+        lista.insert(0, lista.pop(lista.index(_ultimo_que_funcionou)))
+    tentativas = lista[:6]
     config = types.GenerateContentConfig(
         response_mime_type="application/json" if json_saida else None,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
@@ -74,6 +81,7 @@ def _gerar(cliente, modelos, prompt: str, json_saida: bool = False) -> str:
             if ocupado and i < len(tentativas) - 1:
                 continue   # modelo ocupado ou lento: tenta o próximo da lista
             raise
+        _ultimo_que_funcionou = modelo
         texto = resposta.text or ""
         if i > 0 and not json_saida:
             texto += f"\n\n*(Respondido pelo {modelo}: o {tentativas[0]} estava ocupado.)*"
@@ -132,6 +140,82 @@ Aponte SÓ o que falta ou está errado:
 
 --- CÓDIGO ---
 {codigo}
+
+--- CASOS DE TESTE (CSV) ---
+{casos_csv}""")
+
+
+def sugerir_caminhos(cliente, modelos, codigo: str, unidade: str, nos: str, caminhos: str) -> str:
+    """Sprint 2 — para cada caminho básico que o Python montou, a IA sugere as entradas que fazem o
+    programa passar exatamente por ele (e avisa quando o caminho é inviável)."""
+    return _gerar(cliente, modelos, f"""{PAPEL}
+
+Teste estrutural (caixa-branca) da unidade `{unidade}`. Um programa Python montou o Grafo de
+Fluxo de Controle (GFC) e os caminhos básicos de McCabe abaixo — não recalcule V(G).
+Para CADA caminho, proponha um caso de teste numa tabela Markdown:
+| Caminho | Entradas | Resultado esperado | Viável? |
+- Entradas concretas que forçam exatamente as decisões do caminho (V/F).
+- Se nenhuma entrada consegue percorrer o caminho, escreva "inviável" e explique em 1 frase
+  (ex.: uma decisão depende da outra). Sugira por qual caminho independente trocá-lo.
+Depois da tabela, no máximo 3 observações curtas. Não escreva código.
+
+--- CÓDIGO ---
+{codigo}
+
+--- NÓS DO GRAFO ---
+{nos}
+
+--- CAMINHOS BÁSICOS ---
+{caminhos}""")
+
+
+def derivar_casos(cliente, modelos, cenario: str, requisitos: list) -> list:
+    """Aula 14/10 — a IA deriva casos de teste dos requisitos (como num caso de uso).
+    Quem confere a cobertura (RTM) depois é o Python (rtm.py)."""
+    from rtm import FLUXOS
+    lista = "\n".join(f"[{r.id}]: {r.descricao}" for r in requisitos)
+    resposta = _gerar(cliente, modelos, f"""{PAPEL}
+
+Cenário: {cenario or "livre"}
+Derive casos de teste de caixa-preta a partir dos requisitos abaixo, pensando em casos de uso:
+- fluxo PRINCIPAL (caminho feliz): tudo dá certo;
+- fluxos ALTERNATIVOS: desvios aceitáveis e condições de LIMITE — quando houver números, use
+  AVL com ε (ex.: multa de R$ 2,00 por dia → 0, 1 e 2 dias de atraso, ε = 1 dia);
+- fluxos de EXCEÇÃO: bloqueios e erros que o sistema precisa barrar.
+Todo requisito precisa de pelo menos 1 caso. Um caso pode rastrear vários requisitos
+(ex.: cadastro → busca → comprovante = REQ01, REQ04, REQ05). Use só os IDs da lista.
+Seja conciso: de 1 a 3 casos por requisito (no máximo 12 no total), título curto,
+até 3 passos curtos, e dados e resultado esperado em uma frase cada.
+Responda SOMENTE com JSON: uma lista de objetos com as chaves
+  "id" ("CT01"...), "titulo", "fluxo" (um de {FLUXOS}), "requisitos" (lista de IDs),
+  "pre_condicoes", "passos", "dados", "resultado_esperado" (o oráculo: o que a especificação manda).
+
+{lista}""", json_saida=True)
+    dados = json.loads(resposta)
+    if isinstance(dados, dict):              # às vezes vem {"casos": [...]}
+        dados = next((v for v in dados.values() if isinstance(v, list)), [])
+    casos = []
+    for d in dados:
+        if isinstance(d, dict):              # listas (ex.: passos) viram texto corrido
+            casos.append({k: "; ".join(map(str, v)) if isinstance(v, list) and k != "requisitos" else v
+                          for k, v in d.items()})
+    return casos
+
+
+def revisar_rtm(cliente, modelos, cenario: str, requisitos: list, casos_csv: str) -> str:
+    """Aula 14/10 — revisão (pair programming) da derivação e da matriz de rastreabilidade."""
+    lista = "\n".join(f"[{r.id}]: {r.descricao}" for r in requisitos)
+    return _gerar(cliente, modelos, f"""{PAPEL}
+
+Revise, em pair programming, a derivação de casos de teste do cenário "{cenario or 'livre'}".
+Aponte SÓ o que falta ou está errado:
+1. Requisitos sem fluxo de exceção ou sem teste de limite quando deveriam ter.
+2. Resultados esperados vagos (o oráculo precisa ser verificável).
+3. Rastreios errados (caso apontando para o requisito errado).
+4. Até 3 casos extras, em tabela Markdown, com o rastreio.
+
+--- REQUISITOS ---
+{lista}
 
 --- CASOS DE TESTE (CSV) ---
 {casos_csv}""")
